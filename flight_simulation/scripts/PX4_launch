@@ -1,0 +1,8 @@
+#!/bin/bash
+
+cd
+cd ~/PX4_dev/PX4-Autopilot/
+export PX4_HOME_LAT=26.475538
+export PX4_HOME_LON=73.120176
+export PX4_HOME_ALT=238.0
+make px4_sitl gazebo-classic_iris__baylands

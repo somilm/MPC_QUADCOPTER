@@ -1,0 +1,327 @@
+#! /usr/bin/env python3
+
+import rospy
+import time
+import sympy  as sp
+import pandas as pd
+from math import *
+from multiprocessing import Process
+from threading import Thread
+from geometry_msgs.msg import PoseStamped
+from flight_msg.msg import FlightTargetTrajectory, FlightStateEstimation
+
+
+class Global_Parameters:
+    def __init__(self):
+        self.t        = 0.0
+        self.t_1      = 0.0
+        self.x_bar    = 0.0
+        self.x_bar_1  = 0.0
+        self.y_bar    = 0.0
+        self.y_bar_1  = 0.0
+        self.z_bar    = 0.0
+        self.z_bar_1  = 0.0
+        self.q0_bar   = 0.0
+        self.q1_bar   = 0.0
+        self.q2_bar   = 0.0
+        self.q3_bar   = 0.0
+        self.target_x = 0.0
+        self.target_y = 0.0
+        self.target_z = 0.0
+        self.Pbx      = 0.0
+        self.Pbx_1    = 0.0
+        self.Pby      = 0.0
+        self.Pby_1    = 0.0
+        self.Pbz      = 0.0
+        self.Pbz_1    = 0.0
+        self.Pgx      = 0.0
+        self.Pgx_1    = 0.0
+        self.Pgy      = 0.0
+        self.Pgy_1    = 0.0
+        self.Pgz      = 0.0
+        self.Pgz_1    = 0.0
+        self.psi      = 0.0
+        self.psi_1    = 0.0
+        self.theta    = 0.0
+        self.theta_1  = 0.0
+        self.phi      = 0.0
+        self.phi_1    = 0.0
+
+        self.u_bar    = 0.0
+        self.v_bar    = 0.0
+        self.w_bar    = 0.0
+        self.dpsi     = 0.0
+        self.dtheta   = 0.0
+        self.dphi     = 0.0
+        self.dPbx     = 0.0
+        self.dPby     = 0.0
+        self.dPbz     = 0.0
+        self.dPgx     = 0.0
+        self.dPgy     = 0.0
+        self.dPgz     = 0.0
+
+        self.rate     = 5.0
+
+
+pm = Global_Parameters()
+
+
+def quad_pose_cb(quad):
+    global pm
+    pm.t      = time.perf_counter()
+    pm.x_bar  = quad.pose.position.x
+    pm.y_bar  = quad.pose.position.y
+    pm.z_bar  = quad.pose.position.z
+    pm.q0_bar = quad.pose.orientation.w
+    pm.q1_bar = quad.pose.orientation.x
+    pm.q2_bar = quad.pose.orientation.y
+    pm.q3_bar = quad.pose.orientation.z
+
+
+def fixed2body_n_quat2euler(x, y, z, q0, q1, q2, q3, target_x, target_y, target_z):
+    Tf = sp.Matrix([
+        [(pow(q0, 2) + pow(q1, 2) - pow(q2, 2) - pow(q3, 2)), 2*(q1*q2 - q0*q3), 2*(q0*q2 + q1*q3), x],
+        [2*(q1*q2 + q0*q3), (pow(q0, 2) - pow(q1, 2) + pow(q2, 2) - pow(q3, 2)), 2*(q2*q3 - q0*q1), y],
+        [2*(q1*q3 - q0*q2), 2*(q0*q1 + q2*q3), (pow(q0, 2) - pow(q1, 2) - pow(q2, 2) + pow(q3, 2)), z],
+        [                     0,                     0,                     0,                      1]
+    ])
+
+    Point = Tf**-1*sp.Matrix([[target_x], [target_y], [target_z], [1]])
+
+    phi   = atan2(2*(q0*q1 + q2*q3), (1 - 2*(q1**2 + q2**2)))
+    theta = asin(2*(q0*q2 - q3*q1))
+    psi   = atan2(2*(q0*q3 + q1*q2), (1 - 2*(q2**2 + q3**2)))
+
+    return Point[0], Point[1], Point[2], psi, theta, phi
+
+
+def update(pm):
+    prev_time    = 0.0
+    eststate_msg = FlightStateEstimation()
+    rate         = rospy.Rate(20)
+    
+    pub_eststate = rospy.Publisher("/estimated_state", FlightStateEstimation, queue_size = 10)
+    
+    while rospy.is_shutdown():
+        time.sleep(0.1)
+
+    while not rospy.is_shutdown():
+        # if time.perf_counter() - prev_time < (1/25.0):
+        #     time.sleep((0.999/25.0) - (time.perf_counter() - prev_time))
+        # while time.perf_counter() - prev_time < (0.99/25.0):
+        #     pass
+        
+        # prev_time = time.perf_counter()
+
+        pm.Pbx, pm.Pby, pm.Pbz, pm.psi, pm.theta, pm.phi = fixed2body_n_quat2euler(pm.x_bar, pm.y_bar, pm.z_bar, pm.q0_bar, pm.q1_bar, pm.q2_bar, pm.q3_bar, pm.target_x, pm.target_y, pm.target_z)
+        pm.Pgx, pm.Pgy, pm.Pgz                           = pm.target_x, pm.target_y, pm.target_z
+
+        try:
+            pm.u_bar  = ((pm.x_bar - pm.x_bar_1)/(pm.t - pm.t_1))
+            pm.v_bar  = ((pm.y_bar - pm.y_bar_1)/(pm.t - pm.t_1))
+            pm.w_bar  = ((pm.z_bar - pm.z_bar_1)/(pm.t - pm.t_1))
+            pm.dPbx   = (    (pm.Pbx - pm.Pbx_1)/(pm.t - pm.t_1))
+            pm.dPby   = (    (pm.Pby - pm.Pby_1)/(pm.t - pm.t_1))
+            pm.dPbz   = (    (pm.Pbz - pm.Pbz_1)/(pm.t - pm.t_1))
+            pm.dPgx   = (    (pm.Pgx - pm.Pgx_1)/(pm.t - pm.t_1))
+            pm.dPgy   = (    (pm.Pgy - pm.Pgy_1)/(pm.t - pm.t_1))
+            pm.dPgz   = (    (pm.Pgz - pm.Pgz_1)/(pm.t - pm.t_1))
+            
+            pm.dpsi   = (    (pm.psi - pm.psi_1)/(pm.t - pm.t_1))
+            pm.dtheta = ((pm.theta - pm.theta_1)/(pm.t - pm.t_1))
+            pm.dphi   = (    (pm.phi - pm.phi_1)/(pm.t - pm.t_1))
+
+        except:
+            pass
+
+        pm.t_1     = pm.t
+        pm.x_bar_1 = pm.x_bar
+        pm.y_bar_1 = pm.y_bar
+        pm.z_bar_1 = pm.z_bar
+        pm.Pbx_1   = pm.Pbx
+        pm.Pby_1   = pm.Pby
+        pm.Pbz_1   = pm.Pbz
+        pm.Pgx_1   = pm.Pgx
+        pm.Pgy_1   = pm.Pgy
+        pm.Pgz_1   = pm.Pgz
+        pm.psi_1   = pm.psi
+        pm.theta_1 = pm.theta
+        pm.phi_1   = pm.phi
+
+        eststate_msg.header.stamp    = rospy.Time.now()
+        eststate_msg.header.seq      = eststate_msg.header.seq + 1
+        eststate_msg.header.frame_id = "Quadcopter State in Local Coordinate System"
+        eststate_msg.x_bar           = pm.x_bar
+        eststate_msg.y_bar           = pm.y_bar
+        eststate_msg.z_bar           = pm.z_bar
+        eststate_msg.q0_bar          = pm.q0_bar
+        eststate_msg.q1_bar          = pm.q1_bar
+        eststate_msg.q2_bar          = pm.q2_bar
+        eststate_msg.q3_bar          = pm.q3_bar
+        eststate_msg.phi             = pm.phi
+        eststate_msg.theta           = pm.theta
+        eststate_msg.psi             = pm.psi
+        eststate_msg.Pgx             = pm.Pgx
+        eststate_msg.Pgy             = pm.Pgy
+        eststate_msg.Pgz             = pm.Pgz
+        eststate_msg.Pbx             = pm.Pbx
+        eststate_msg.Pby             = pm.Pby
+        eststate_msg.Pbz             = pm.Pbz
+        eststate_msg.u_bar           = pm.u_bar
+        eststate_msg.v_bar           = pm.v_bar
+        eststate_msg.w_bar           = pm.w_bar
+        eststate_msg.dphi            = pm.dphi
+        eststate_msg.dtheta          = pm.dtheta
+        eststate_msg.dpsi            = pm.dpsi
+        eststate_msg.dPgx            = pm.dPgx
+        eststate_msg.dPgy            = pm.dPgy
+        eststate_msg.dPgz            = pm.dPgz
+        eststate_msg.dPbx            = pm.dPbx
+        eststate_msg.dPby            = pm.dPby
+        eststate_msg.dPbz            = pm.dPbz
+        eststate_msg.target_x        = pm.target_x
+        eststate_msg.target_y        = pm.target_y
+        eststate_msg.target_z        = pm.target_z
+
+        pub_eststate.publish(eststate_msg)
+
+        rate.sleep()
+
+
+def main():
+    global pm
+    
+    node    = rospy.init_node("measurement")
+
+    pub_target    = rospy.Publisher("/target_trajectory", FlightTargetTrajectory, queue_size = 10)
+    sub_quad_pose = rospy.Subscriber("mavros/local_position/pose", PoseStamped, callback = quad_pose_cb)
+
+    Np      = rospy.get_param("/pred_horizon", default = 20)
+    pm.rate = rospy.get_param("/control_rate", default = pm.rate)
+
+    rate    = rospy.Rate(pm.rate)
+
+    target_msg  = FlightTargetTrajectory()
+
+    des_Y   = sp.zeros(3*Np, 1)
+    # traj_df = pd.read_csv('/home/abhinav/quad_ws/src/flight_simulation/scripts/trajectories/hover_1.csv')
+    # traj_df = pd.read_csv('/home/abhinav/quad_ws/src/flight_simulation/scripts/trajectories/hover_2.csv')
+    traj_df = pd.read_csv('/home/abhinav/quad_ws/src/flight_simulation/scripts/trajectories/lemniscate.csv')
+
+    list_xd = traj_df['x'].tolist()
+    list_yd = traj_df['y'].tolist()
+    list_zd = traj_df['z'].tolist()
+
+    pm.target_x    = list_xd[1]
+    pm.target_y    = list_yd[1]
+    pm.target_z    = list_zd[1]
+
+    no_of_rows  = len(list_xd)
+
+    for i in range(Np):
+        try:
+            des_Y[3*i, 0]     = list_xd[i]
+            des_Y[3*i + 1, 0] = list_yd[i]
+            des_Y[3*i + 2, 0] = list_zd[i]
+        except:
+            des_Y[3*i, 0]     = des_Y[3*i - 3, 0]
+            des_Y[3*i + 1, 0] = des_Y[3*i - 2, 0]
+            des_Y[3*i + 2, 0] = des_Y[3*i - 1, 0]
+
+    ii         = 0
+    prev_time  = 0.0
+
+    update_thread = Thread(target = update, name = "state_update", args = (pm, ))
+    update_thread.start()
+
+    while not rospy.is_shutdown():
+        traj_track = rospy.get_param("/predictive_tracking/traj_track", default = False)
+        traj_reset = rospy.get_param("/predictive_tracking/traj_reset", default = False)
+        
+        if traj_reset:
+            rospy.set_param("/predictive_tracking/traj_reset", False)
+
+            pm.target_x    = list_xd[1]
+            pm.target_y    = list_yd[1]
+            pm.target_z    = list_zd[1]
+
+            for i in range(Np):
+                try:
+                    des_Y[3*i, 0]     = list_xd[i]
+                    des_Y[3*i + 1, 0] = list_yd[i]
+                    des_Y[3*i + 2, 0] = list_zd[i]
+                except:
+                    des_Y[3*i, 0]     = des_Y[3*i - 3, 0]
+                    des_Y[3*i + 1, 0] = des_Y[3*i - 2, 0]
+                    des_Y[3*i + 2, 0] = des_Y[3*i - 1, 0]
+
+            ii = 0
+
+        if traj_track:
+            ii = ii + 1
+
+            pm.target_x = des_Y[3]
+            pm.target_y = des_Y[4]
+            pm.target_z = des_Y[5]
+
+            for i in range(Np):
+                if i != (Np - 1):
+                    des_Y[3*i, 0]     = des_Y[3*i + 3, 0]
+                    des_Y[3*i + 1, 0] = des_Y[3*i + 4, 0]
+                    des_Y[3*i + 2, 0] = des_Y[3*i + 5, 0]
+                else:
+                    try:
+                        des_Y[3*i, 0]     = list_xd[i + ii + 1]
+                        des_Y[3*i + 1, 0] = list_yd[i + ii + 1]
+                        des_Y[3*i + 2, 0] = list_zd[i + ii + 1]
+                    except:
+                        des_Y[3*i, 0]     = des_Y[3*i - 3, 0]
+                        des_Y[3*i + 1, 0] = des_Y[3*i - 2, 0]
+                        des_Y[3*i + 2, 0] = des_Y[3*i - 1, 0]
+
+            target_msg.header.stamp        = rospy.Time.now()
+            target_msg.header.frame_id     = "target trajectory stacked 3D vector transposed"
+            target_msg.stacked3Dtrajectory = des_Y
+
+            # if time.perf_counter() - prev_time < (1/pm.rate):
+            #     time.sleep((0.995/pm.rate) - (time.perf_counter() - prev_time))
+            # while time.perf_counter() - prev_time < (0.99/pm.rate):
+            #     pass
+
+            prev_time = time.perf_counter()
+
+            pub_target.publish(target_msg)
+
+            rate.sleep()
+
+        else:
+            pm.target_x = des_Y[0]
+            pm.target_y = des_Y[1]
+            pm.target_z = des_Y[2]
+
+            for i in range(Np):
+                des_Y[3*i, 0]     = des_Y[0]
+                des_Y[3*i + 1, 0] = des_Y[1]
+                des_Y[3*i + 2, 0] = des_Y[2]
+
+            target_msg.header.stamp        = rospy.Time.now()
+            target_msg.header.frame_id     = "target trajectory stacked 3D vector transposed"
+            target_msg.stacked3Dtrajectory = des_Y
+
+            # if time.perf_counter() - prev_time < (1/pm.rate):
+            #     time.sleep((0.995/pm.rate) - (time.perf_counter() - prev_time))
+            # while time.perf_counter() - prev_time < (0.99/pm.rate):
+            #     pass
+
+            prev_time = time.perf_counter()
+
+            pub_target.publish(target_msg)
+
+            rate.sleep()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass

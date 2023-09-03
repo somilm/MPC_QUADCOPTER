@@ -1,0 +1,756 @@
+#! /usr/bin/env python3
+
+import rospy
+import sympy           as sp
+import numpy           as np
+import pandas          as pd
+import multiprocessing as mp
+import qpsolvers
+import csv
+import time
+import os
+import _thread
+from math import *
+from mavros_msgs.msg   import State, AttitudeTarget, BatteryStatus, ManualControl
+from mavros_msgs.srv   import CommandBool, CommandBoolRequest, SetMode, SetModeRequest
+from flight_msg.msg    import FlightTargetTrajectory, FlightState, FlightStateEstimation
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class Global_Parameters:
+    def __init__(self):
+        self.state_msg    = State()
+        self.battery_msg  = BatteryStatus()
+        self.attitude_msg = AttitudeTarget()
+        self.qc_state_msg = FlightState()
+        self.target_msg   = FlightTargetTrajectory()
+
+        self.Np           = 20                      # prediction horizon of the model
+        self.in_x         = 0.0                     # initial x coordinate of quadcopter
+        self.in_y         = 0.0                     # initial y coordinate of quadcopter
+        self.in_z         = 0.2                     # initial z coordinate of quadcopter
+        self.in_u         = 0.0                     # initial x velocity of quadcopter
+        self.in_v         = 0.0                     # initial y velocity of quadcopter
+        self.in_w         = 0.0                     # initial z velocity of quadcopter
+        self.ab_time      = None                    # absolute time in seconds started from '0'th step
+        self.ts           = 0.2                     # sample time of the model in seconds
+        self.ii           = 0                       # step number ('ii'th step)
+        self.k            = 0                       # prediction number ('k'th prediction made at 'ii'th step)
+        self.sim_steps    = 100                     # number of simulation steps
+        self.x            = self.in_x               # x coordinate of quadcopter
+        self.y            = self.in_y               # y coordinate of quadcopter
+        self.z            = self.in_z               # z coordinate of quadcopter
+        self.u            = self.in_u               # x velocity of quadcopter
+        self.v            = self.in_v               # y velocity of quadcopter
+        self.w            = self.in_w               # z velocity of quadcopter
+        self.p            = 0.0                     # acceleration along x-axis
+        self.q            = 0.0                     # acceleration along y-axis
+        self.r            = 0.0                     # acceleration along z-axis
+        self.rr           = 0.05                    # control input constant
+        self.ss           = 0.50                    # proportionality constant
+        self.tt           = 0.007                   # change in control input constant
+        self.umod         = 0.25                    # upper and lower bound constant
+        self.X            = sp.Matrix(6, 1, [self.x, self.y, self.z, self.u, self.v, self.w]) # state matrix
+        self.o            = sp.Matrix(3, 1, [self.p, self.q, self.r])
+        self.des_Y        = []
+
+        self.start       = False
+        self.got_battery = False
+
+        self.target_x    = 0.0
+        self.target_y    = 0.0
+        self.target_z    = 0.0
+        self.freq        = 0.0
+
+        self.m       = 1.282
+        self.g       = 9.81
+
+        self.kb      = 1.0
+        self.kw      = 0.0562       # 0.0562
+        self.kx      = 0.125        # 0.2
+        self.ky      = 0.2        # 0.375
+        self.kz      = 150.0        # 150.0
+        self.cx      = 0.0
+        self.cy      = 0.0
+        self.cz      = 0.0
+        self.cdx     = 0.0          # 0.0
+        self.cdy     = 0.0          # 0.0
+        self.cdz     = 0.01         # 0.01
+
+        self.t       = 0.0
+        self.x_bar   = 0.0
+        self.y_bar   = 0.0
+        self.z_bar   = 0.0
+        self.q0_bar  = 0.0
+        self.q1_bar  = 0.0
+        self.q2_bar  = 0.0
+        self.q3_bar  = 0.0
+        self.psi     = 0.0
+        self.theta   = 0.0
+        self.phi     = 0.0
+        self.Pbx     = 0.0
+        self.Pby     = 0.0
+        self.Pbz     = 0.0
+        self.Pgx     = 0.0
+        self.Pgy     = 0.0
+        self.Pgz     = 0.0
+
+        self.u_bar   = 0.0
+        self.v_bar   = 0.0
+        self.w_bar   = 0.0
+        self.dPbx    = 0.0
+        self.dPby    = 0.0
+        self.dPbz    = 0.0
+        self.dPgx    = 0.0
+        self.dPgy    = 0.0
+        self.dPgz    = 0.0
+
+        self.dpsi    = 0.0
+        self.dtheta  = 0.0
+        self.dphi    = 0.0
+
+        self.p_prev  = 0.0
+        self.q_prev  = 0.0
+        self.r_prev  = 0.0
+        
+        self.prev_pd = sp.Matrix(3, 1, [0.0, 0.0, 0.0])
+        self.mod_err = 0.0
+
+        self.rc_buttons = 0.0
+        self.rc_yaw     = 0.0
+        self.rc_pitch   = 0.0
+        self.rc_roll    = 0.0
+        self.rc_thrust  = 0.0
+
+        rospy.set_param("exp_setup/kb", self.kb)     # 1.0
+        rospy.set_param("exp_setup/kw", self.kw)     # 0.055
+        rospy.set_param("exp_setup/kx", self.kx)     # 0.17696
+        rospy.set_param("exp_setup/ky", self.ky)     # 0.17696
+        rospy.set_param("exp_setup/kz", self.kz)     # 10.5
+        rospy.set_param("exp_setup/cx", self.cx)     # 0.0
+        rospy.set_param("exp_setup/cy", self.cy)     # 0.0
+        rospy.set_param("exp_setup/cz", self.cz)     # 0.0
+        rospy.set_param("exp_setup/cdx", self.cdx)   # 0.0
+        rospy.set_param("exp_setup/cdy", self.cdy)   # 0.0
+        rospy.set_param("exp_setup/cdz", self.cdz)   # 0.002        
+
+
+pm = Global_Parameters()
+
+
+def state_cb(state):
+    global pm
+    pm.state_msg = state
+
+
+def state_estimation_cb(eststate):
+    global pm
+    pm.t        = rospy.get_time()
+    pm.x_bar    = eststate.x_bar
+    pm.y_bar    = eststate.y_bar
+    pm.z_bar    = eststate.z_bar
+    pm.q0_bar   = eststate.q0_bar
+    pm.q1_bar   = eststate.q1_bar
+    pm.q2_bar   = eststate.q2_bar
+    pm.q3_bar   = eststate.q3_bar
+    pm.phi      = eststate.phi
+    pm.theta    = eststate.theta
+    pm.psi      = eststate.psi
+    pm.Pgx      = eststate.Pgx
+    pm.Pgy      = eststate.Pgy
+    pm.Pgz      = eststate.Pgz
+    pm.Pbx      = eststate.Pbx
+    pm.Pby      = eststate.Pby
+    pm.Pbz      = eststate.Pbz
+    pm.u_bar    = eststate.u_bar
+    pm.v_bar    = eststate.v_bar
+    pm.w_bar    = eststate.w_bar
+    pm.dphi     = eststate.dphi
+    pm.dtheta   = eststate.dtheta
+    pm.dpsi     = eststate.dpsi
+    pm.dPgx     = eststate.dPgx
+    pm.dPgy     = eststate.dPgy
+    pm.dPgz     = eststate.dPgz
+    pm.dPbx     = eststate.dPbx
+    pm.dPby     = eststate.dPby
+    pm.dPbz     = eststate.dPbz
+    pm.target_x = eststate.target_x
+    pm.target_y = eststate.target_y
+    pm.target_z = eststate.target_z
+
+
+def rc_cb(control):
+    global pm
+    pm.rc_buttons = control.buttons
+    pm.rc_yaw     = control.r
+    pm.rc_pitch   = 0.25*control.x
+    pm.rc_roll    = 0.25*(-control.y)
+    pm.rc_thrust  = 0.50*(control.z - 0.5)
+
+
+def target_cb(target):
+    global pm
+    pm.target_msg = target
+    pm.des_Y      = sp.Matrix(3*pm.Np, 1, target.stacked3Dtrajectory)
+
+
+def update_parameters():
+    global pm
+    pm.kb  = rospy.get_param("exp_setup/kb",  default = 1.0)     # 1.0
+    pm.kw  = rospy.get_param("exp_setup/kw",  default = 0.057)   # 0.055
+    pm.kx  = rospy.get_param("exp_setup/kx",  default = 0.17696) # 0.17696
+    pm.ky  = rospy.get_param("exp_setup/ky",  default = 0.17696) # 0.17696
+    pm.kz  = rospy.get_param("exp_setup/kz",  default = 50.0)    # 10.5
+    pm.cx  = rospy.get_param("exp_setup/cx",  default = 0.0)     # 0.0
+    pm.cy  = rospy.get_param("exp_setup/cy",  default = 0.0)     # 0.0
+    pm.cz  = rospy.get_param("exp_setup/cz",  default = 0.0)     # 0.0
+    pm.cdx = rospy.get_param("exp_setup/cdx", default = 0.0)     # 0.0
+    pm.cdy = rospy.get_param("exp_setup/cdy", default = 0.0)     # 0.0
+    pm.cdz = rospy.get_param("exp_setup/cdz", default = 0.002)   # 0.002
+
+
+def eul2quat(phi, theta, psi):
+    roll, pitch, yaw = phi, theta, psi
+
+    cr = cos(roll * 0.5);
+    sr = sin(roll * 0.5);
+    cp = cos(pitch * 0.5);
+    sp = sin(pitch * 0.5);
+    cy = cos(yaw * 0.5);
+    sy = sin(yaw * 0.5);
+
+    q0 = cr * cp * cy + sr * sp * sy;
+    q1 = sr * cp * cy - cr * sp * sy;
+    q2 = cr * sp * cy + sr * cp * sy;
+    q3 = cr * cp * sy - sr * sp * cy;
+    
+    return q0, q1, q2, q3
+
+
+def fixed_to_body_frame(x, y, z, q0, q1, q2, q3, target_x, target_y, target_z):
+    Tf = sp.Matrix([
+        [(pow(q0, 2) + pow(q1, 2) - pow(q2, 2) - pow(q3, 2)), 2*(q1*q2 - q0*q3), 2*(q0*q2 + q1*q3), x],
+        [2*(q1*q2 + q0*q3), (pow(q0, 2) - pow(q1, 2) + pow(q2, 2) - pow(q3, 2)), 2*(q2*q3 - q0*q1), y],
+        [2*(q1*q3 - q0*q2), 2*(q0*q1 + q2*q3), (pow(q0, 2) - pow(q1, 2) - pow(q2, 2) + pow(q3, 2)), z],
+        [                     0,                     0,                     0,                      1]
+    ])
+
+    Point = Tf**-1*sp.Matrix([[target_x], [target_y], [target_z], [1]])
+
+    phi   = atan2(2*(q0*q1 + q2*q3), (1 - 2*(q1**2 + q2**2)))
+    theta = asin(2*(q0*q2 - q3*q1))
+    psi   = atan2(2*(q0*q3 + q1*q2), (1 - 2*(q2**2 + q3**2)))
+
+    return Point[0], Point[1], Point[2], psi, theta, phi
+
+
+def predict(X, U, G, H):
+    Y = G*X + H*U
+    return Y
+
+
+def cost(Q, R, U):
+    J = 0.5*U.T*Q*U + R.T*U
+    return J
+
+
+def solve_quadprog(Q, R, A_con, B_con):
+    sol   = qpsolvers.solve_qp(Q, R, A_con, B_con, solver = 'osqp')
+    U_cal = sp.Matrix(sol)
+    return U_cal
+
+
+# def write_csv(Np, ii, matheight, time_elapsed, p, q, r, U_cal, x, y, z, Y, u, v, w, pred_u, pred_v, pred_w, xd0, yd0, zd0, des_Y):
+#     data = []
+
+#     for i in range(12*(Np + 1) + 2):
+#         if   i == 0:
+#             data.append(ii + 1)
+#         elif i == 1:
+#             data.append(time_elapsed)
+#         elif i == 2:
+#             data.append(p)
+#         elif (i >= 3) & (i <= (Np + 2)):
+#             data.append(U_cal[matheight*(i - 3)])
+#         elif i == (Np + 3):
+#             data.append(q)
+#         elif (i >= (Np + 4)) & (i <= (2*Np + 3)):
+#             data.append(U_cal[matheight*(i - (Np + 4)) + 1])
+#         elif i == (2*Np + 4):
+#             data.append(r)
+#         elif (i >= (2*Np + 5)) & (i <= (3*Np + 4)):
+#             data.append(U_cal[matheight*(i - (2*Np + 5)) + 2])
+#         elif i == (3*Np + 5):
+#             data.append(x)
+#         elif (i >= (3*Np + 6)) & (i <= (4*Np + 5)):
+#             data.append(Y[matheight*(i - (3*Np + 6))])
+#         elif i == (4*Np + 6):
+#             data.append(y)
+#         elif (i >= (4*Np + 7)) & (i <= (5*Np + 6)):
+#             data.append(Y[matheight*(i - (4*Np + 7)) + 1])
+#         elif i == (5*Np + 7):
+#             data.append(z)
+#         elif (i >= (5*Np + 8)) & (i <= (6*Np + 7)):
+#             data.append(Y[matheight*(i - (5*Np + 8)) + 2])
+#         elif i == (6*Np + 8):
+#             data.append(u)
+#         elif (i >= (6*Np + 9)) & (i <= (7*Np + 8)):
+#             data.append(pred_u[(i - (6*Np + 9))])
+#         elif i == (7*Np + 9):
+#             data.append(v)
+#         elif (i >= (7*Np + 10)) & (i <= (8*Np + 9)):
+#             data.append(pred_v[(i - (7*Np + 10))])
+#         elif i == (8*Np + 10):
+#             data.append(w)
+#         elif (i >= (8*Np + 11)) & (i <= (9*Np + 10)):
+#             data.append(pred_w[(i - (8*Np + 11))])
+#         elif i == (9*Np + 11):
+#             data.append(xd0)
+#         elif (i >= (9*Np + 12)) & (i <= (10*Np + 11)):
+#             data.append(des_Y[matheight*(i - (9*Np + 12))])
+#         elif i == (10*Np + 12):
+#             data.append(yd0)
+#         elif (i >= (10*Np + 13)) & (i <= (11*Np + 12)):
+#             data.append(des_Y[matheight*(i - (10*Np + 13)) + 1])
+#         elif i == (11*Np + 13):
+#             data.append(zd0)
+#         else:                                                                               # (i >= (11*Np + 14)) & (i <= (12*Np + 13))
+#             data.append(des_Y[matheight*(i - (11*Np + 14)) + 2])
+
+#     with open('MPC_on_Quadcopter.csv', 'a', newline = '') as csv_file:
+#         csv_writer = csv.writer(csv_file)
+#         csv_writer.writerow(data)
+
+
+if __name__ == "__main__":
+    rospy.init_node("predictive_tracking")
+
+    # while True:
+    #     try:
+    #         node_up = rospy.wait_for_message("picopter/parameters", FlightParameters, timeout = 10)
+    #         print('communication established to the ground station')
+    #         break
+    #     except:
+    #         print('waiting for the response from ground station...')
+
+    state_sub    = rospy.Subscriber("mavros/state", State, callback = state_cb)
+    target_sub   = rospy.Subscriber("target_trajectory", FlightTargetTrajectory, callback = target_cb)
+    eststate_sub = rospy.Subscriber("estimated_state", FlightStateEstimation, callback = state_estimation_cb)
+    rc_sub       = rospy.Subscriber("mavros/manual_control/control", ManualControl, callback = rc_cb)
+
+    attitude_pub = rospy.Publisher("mavros/setpoint_raw/attitude", AttitudeTarget, queue_size = 10)
+    qc_state_pub = rospy.Publisher("picopter/state", FlightState, queue_size = 10)
+
+    rospy.wait_for_service("/mavros/cmd/arming")
+    arming_client   = rospy.ServiceProxy("mavros/cmd/arming", CommandBool)    
+
+    rospy.wait_for_service("/mavros/set_mode")
+    set_mode_client = rospy.ServiceProxy("mavros/set_mode", SetMode)
+    
+    rate = rospy.Rate(5)
+
+    time.sleep(2.75)
+
+    process = mp.Pool(mp.cpu_count())
+
+    while(not rospy.is_shutdown() and not pm.state_msg.connected):
+        rate.sleep()
+
+    pm.attitude_msg.thrust      = 0.3
+    pm.attitude_msg.body_rate.x = 0.0
+    pm.attitude_msg.body_rate.y = 0.0
+    pm.attitude_msg.body_rate.z = 0.0
+
+    for i in range(75):   
+        if(rospy.is_shutdown()):
+            break
+
+        attitude_pub.publish(pm.attitude_msg)
+        rate.sleep()
+
+    # --------------------------------------------------------------------------------------------------
+
+    pm.x = pm.x_bar
+    pm.y = pm.y_bar
+    pm.z = pm.z_bar
+    pm.u = pm.u_bar
+    pm.v = pm.v_bar
+    pm.w = pm.w_bar
+
+    weightage = 1.0
+
+    # headers = ['step no.', 'uptime']
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'p{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'q{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'r{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'x{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'y{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'z{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'u{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'v{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'w{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'xd{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'yd{i}')
+
+    # for i in range(pm.Np + 1):
+    #     headers.append(f'zd{i}')
+
+    # with open('MPC_on_Quadcopter.csv', 'w', newline = '') as csv_file:
+    #     csv_writer = csv.DictWriter(csv_file, fieldnames = headers)
+    #     csv_writer.writeheader()
+
+    headers = ['step no.', 'uptime', 'x', 'y', 'z', 'u', 'v', 'w', 'p', 'q', 'r', 'p_m', 'q_m', 'r_m', 'p_t', 'q_t', 'r_t', 'wt_ac', 'wt_mc']
+
+    with open('MPC_with_HITL_strategy_2.csv', 'w', newline = '') as csv_file:
+        csv_writer = csv.DictWriter(csv_file, fieldnames = headers)
+        csv_writer.writeheader()
+
+    A = sp.Matrix(6, 6, [1, 0, 0, pm.ts, 0, 0, 0, 1, 0, 0, pm.ts, 0, 0, 0, 1, 0, 0, pm.ts, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1])
+    B = sp.Matrix(6, 3, [0.5*(pm.ts**2), 0, 0, 0, 0.5*(pm.ts**2), 0, 0, 0, 0.5*(pm.ts**2), pm.ts, 0, 0, 0, pm.ts, 0, 0, 0, pm.ts])
+    C = sp.Matrix(3, 6, [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0])
+
+    (matheight ,matlen) = sp.Matrix((C*A)).shape
+    G_ele  = sp.eye(len(A[0,:]))
+    G      = sp.zeros(pm.Np*matheight, matlen)              # defining G matrix for the cost function
+
+    for i in range(pm.Np):                                  # forming G matrix for the cost function
+        G_ele                                              = G_ele*A
+        G[i*matheight:(i*matheight + matheight), 0:matlen] = C*G_ele
+
+    H = sp.zeros(pm.Np*matheight, pm.Np*matheight)             # defining H matrix for the cost function
+
+    for j in range(pm.Np):                                  # forming H matrix for the cost function
+        H_ele  = sp.eye(len(A[0,:]))
+        for i in range(pm.Np):
+            if i >= j:
+                if i > j:
+                    H_ele = H_ele*A
+                H[i*matheight:(i*matheight + matheight), j*matheight:(j*matheight + matheight)] = C*H_ele*B
+
+    D = sp.zeros(pm.Np*matheight)
+    D = sp.Identity(pm.Np*matheight)
+
+    xd0 = pm.des_Y[0]
+    yd0 = pm.des_Y[1]
+    zd0 = pm.des_Y[2]
+
+    L = pm.rr*D.T*D + pm.ss*H.T*H
+    L = sp.Matrix(L)
+
+    M = sp.zeros(matheight*pm.Np)
+
+    for i in range(pm.Np):
+        if i == 0:
+            M[i*matheight, i*matheight] = sp.eye(matheight)
+        elif i == (pm.Np - 1):
+            M[i*matheight, i*matheight] = sp.eye(matheight)
+        else:
+            M[i*matheight, i*matheight] = 2*sp.eye(matheight)
+
+        if i != 0:
+            M[(i - 1)*matheight, i*matheight] = -sp.eye(matheight)
+            M[i*matheight, (i - 1)*matheight] = -sp.eye(matheight)
+
+    Q = L + pm.tt*2*M
+    Q = sp.Matrix(Q)
+
+    R = pm.ss*H.T*(G*pm.X - pm.des_Y)
+    R = sp.Matrix(R)
+
+    A_con                                                       = sp.zeros(2*pm.Np*matheight, pm.Np*matheight)
+    A_con[0:pm.Np*matheight, 0:pm.Np*matheight]                 = -sp.eye(pm.Np*matheight)
+    A_con[pm.Np*matheight:2*pm.Np*matheight, 0:pm.Np*matheight] = sp.eye(pm.Np*matheight)
+    B_con                                                       = sp.ones(2*matheight*pm.Np, 1)*pm.umod
+
+    Q     = np.array( Q.tolist()).astype(np.float64)
+    R     = np.array( R.tolist()).astype(np.float64)
+    A_con = np.array(A_con.tolist()).astype(np.float64)
+    B_con = np.array(B_con.tolist()).astype(np.float64)
+
+    # --------------------------------------------------------------------------------------------------
+    
+    if pm.start == False:
+        start_t   = pm.t
+        start_x   = pm.x_bar
+        start_y   = pm.y_bar
+        start_z   = pm.z_bar
+        start_psi = pm.psi
+        start     = True
+
+    offb_set_mode = SetModeRequest()
+    offb_set_mode.custom_mode = 'OFFBOARD'
+
+    arm_cmd = CommandBoolRequest()
+    arm_cmd.value = True
+
+    last_req = rospy.Time.now()
+
+    last_t   = time.perf_counter()
+
+    rospy.set_param("/predictive_tracking/traj_track", True)
+
+    while not rospy.is_shutdown():
+        update_parameters()
+
+        norm = sp.Matrix(3, 1, [pm.x_bar, pm.y_bar, pm.z_bar]) - pm.prev_pd
+        norm = np.array(norm.tolist()).astype(np.float64)
+
+        pm.mod_err = np.linalg.norm(norm)*100
+
+        # --------------------------------------------------------------- SETTING OFFBOARD MODE & ARMING
+
+        if(pm.state_msg.mode != "OFFBOARD" and (rospy.Time.now() - last_req) > rospy.Duration(5.0)):
+            if(set_mode_client.call(offb_set_mode).mode_sent == True):
+                rospy.loginfo("OFFBOARD enabled")
+            
+            last_req = rospy.Time.now()
+
+        else:
+            if(not pm.state_msg.armed and (rospy.Time.now() - last_req) > rospy.Duration(5.0)):
+                if(arming_client.call(arm_cmd).success == True):
+                    rospy.loginfo("Vehicle armed")
+            
+                last_req = rospy.Time.now()
+
+        # ----------------------------------------------------------------------------------------------
+
+        if pm.ii == 0:
+            start_time = time.perf_counter()
+
+        sol   = qpsolvers.solve_qp(Q, R, A_con, B_con, solver = 'osqp')
+        U_cal = sp.Matrix(sol)
+
+        Y     = predict(pm.X, U_cal, G, H)              # making predictions
+
+        pm.prev_pd = sp.Matrix(3, 1, Y[0:3, 0])
+
+        pred_u = sp.zeros(pm.Np, 1)
+
+        for i in range(pm.Np):
+            if i == 0:
+                pred_u[i, 0] = pm.u + U_cal[matheight*i, 0]*pm.ts
+            else:
+                pred_u[i, 0] = pred_u[i - 1, 0] 
+
+        pred_v = sp.zeros(pm.Np, 1)
+
+        for i in range(pm.Np):
+            if i == 0:
+                pred_v[i, 0] = pm.v + U_cal[matheight*i + 1, 0]*pm.ts
+            else:
+                pred_v[i, 0] = pred_v[i - 1, 0] + U_cal[matheight*i + 1, 0]*pm.ts
+                
+        pred_w = sp.zeros(pm.Np, 1)
+
+        for i in range(pm.Np):
+            if i == 0:
+                pred_w[i, 0] = pm.w + U_cal[matheight*i + 2, 0]*pm.ts
+            else:
+                pred_w[i, 0] = pred_w[i - 1, 0] + U_cal[matheight*i + 2, 0]*pm.ts
+
+        time_elapsed = time.perf_counter() - start_time
+
+        # process.apply_async(write_csv, args = (pm.Np, pm.ii, matheight, time_elapsed, pm.p, pm.q, pm.r, U_cal, pm.x, pm.y, pm.z, Y, pm.u, pm.v, pm.w, pred_u, pred_v, pred_w, xd0, yd0, zd0, pm.des_Y))
+
+        data    = []
+
+        data.append(pm.ii + 1)
+        data.append(time_elapsed)
+        data.append(pm.x)
+        data.append(pm.y)
+        data.append(pm.z)
+        data.append(pm.u)
+        data.append(pm.v)
+        data.append(pm.w)
+        data.append(pm.p)
+        data.append(pm.q)
+        data.append(pm.r)
+
+        xd0 = pm.des_Y[0]
+        yd0 = pm.des_Y[1]
+        zd0 = pm.des_Y[2]
+
+        if (pm.rc_roll != 0.0) or (pm.rc_pitch != 0.0):
+            weightage = weightage - (1/3)
+            if weightage < 0.0:
+                weightage = 0.0
+        else:
+            weightage = weightage + (1/3)
+            if weightage > 1.0:
+                weightage = 1.0
+
+        total_p = weightage*pm.p + (1 - weightage)*pm.rc_pitch
+        total_q = weightage*pm.q + (1 - weightage)*pm.rc_roll
+        total_r = weightage*pm.r + (1 - weightage)*pm.rc_thrust
+        
+        data.append(pm.rc_pitch)
+        data.append(pm.rc_roll)
+        data.append(pm.rc_thrust)
+        data.append(total_p)
+        data.append(total_q)
+        data.append(total_r)
+        data.append(weightage)
+        data.append(1 - weightage)
+
+        with open('MPC_with_HITL_strategy_2.csv', 'a', newline = '') as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(data)
+
+        thrust  = pm.kb*(((total_r - pm.cz + pm.cdz*(pm.w**2))/pm.kz) + pm.kw*pm.m*pm.g)
+        yaw     = 0.0
+        pitch   = ((total_p - pm.cx + pm.cdx*(pm.u**2))/pm.kx)*(pi/180)
+        roll    = -(((total_q - pm.cy + pm.cdy*(pm.v**2))/pm.ky)*(pi/180))
+
+        # pitch, roll, notreq_1, notreq_2, notreq_3, notreq_4 = fixed_to_body_frame(0.0, 0.0, 0.0, q0_bar, q1_bar, q2_bar, q3_bar, pitch, roll, yaw)
+
+        q0_t, q1_t, q2_t, q3_t = eul2quat(roll, pitch, yaw)
+
+        pm.attitude_msg.type_mask     = 7
+        pm.attitude_msg.thrust        = thrust
+        pm.attitude_msg.orientation.w = q0_t
+        pm.attitude_msg.orientation.x = q1_t
+        pm.attitude_msg.orientation.y = q2_t
+        pm.attitude_msg.orientation.z = q3_t
+
+        attitude_pub.publish(pm.attitude_msg)
+
+        pm.qc_state_msg.quadcopter_id           = "Quadcopter 1"
+        pm.qc_state_msg.header.seq              = pm.qc_state_msg.header.seq + 1
+        pm.qc_state_msg.header.stamp            = rospy.Time.now()
+        pm.qc_state_msg.header.frame_id         = "Quadcopter State in Local Coordinate System"
+        pm.qc_state_msg.flight_duration         = pm.t - start_t
+        pm.qc_state_msg.offboard_mode           = "Position Track"
+        pm.qc_state_msg.thrust                  = thrust
+        pm.qc_state_msg.body_pose.position.x    = pm.x
+        pm.qc_state_msg.body_pose.position.y    = pm.y
+        pm.qc_state_msg.body_pose.position.z    = pm.z
+        pm.qc_state_msg.body_pose.orientation.w = pm.q0_bar
+        pm.qc_state_msg.body_pose.orientation.x = pm.q1_bar
+        pm.qc_state_msg.body_pose.orientation.y = pm.q2_bar
+        pm.qc_state_msg.body_pose.orientation.z = pm.q3_bar
+        pm.qc_state_msg.body_rate.linear.x      = pm.u_bar
+        pm.qc_state_msg.body_rate.linear.y      = pm.v_bar
+        pm.qc_state_msg.body_rate.linear.z      = pm.w_bar
+        pm.qc_state_msg.body_rate.angular.x     = pm.dphi
+        pm.qc_state_msg.body_rate.angular.y     = pm.dtheta
+        pm.qc_state_msg.body_rate.angular.z     = pm.dpsi
+
+        qc_state_pub.publish(pm.qc_state_msg)
+
+        pm.ii = pm.ii + 1
+
+        o    = sp.Matrix(U_cal[0:3])
+        pm.p = o[0]
+        pm.q = o[1]
+        pm.r = o[2]
+
+        # pm.x = pm.x_bar                                   # Normal State Update in MPC
+        # pm.y = pm.y_bar                                   #
+        # pm.z = pm.z_bar                                   #
+        # pm.u = pm.u_bar                                   #
+        # pm.v = pm.v_bar                                   #
+        # pm.w = pm.w_bar                                   #
+
+        pm.x = pm.x_bar + pm.u_bar*0.2 + pm.p_prev*0.04     # Delay Compensated State Update in MPC
+        pm.y = pm.y_bar + pm.v_bar*0.2 + pm.q_prev*0.04     #
+        pm.z = pm.z_bar + pm.w_bar*0.2 + pm.r_prev*0.04     #
+        pm.u = pm.u_bar + pm.p_prev*0.2                     #
+        pm.v = pm.v_bar + pm.p_prev*0.2                     #
+        pm.w = pm.w_bar + pm.p_prev*0.2                     #
+
+        pm.X = sp.Matrix(6, 1, [pm.x, pm.y, pm.z, pm.u, pm.v, pm.w])
+        R    = H.T*(G*pm.X - pm.des_Y)
+        R    = sp.Matrix(R)
+        R    = np.array(R.tolist()).astype(np.float64)
+
+        # pm.p_prev = pm.p
+        # pm.q_prev = pm.q
+        # pm.r_prev = pm.r
+
+        pm.p_prev = total_p
+        pm.q_prev = total_q
+        pm.r_prev = total_r
+
+        print(f'''\n\n\n\n\n\n\n
+        -----------------------------------------
+
+        Quadcopter State: -
+
+        X              : {round(          pm.x, 3)}
+        Y              : {round(          pm.y, 3)}
+        Z              : {round(          pm.z, 3)}
+        X_vel          : {round(          pm.u, 3)}
+        Y_vel          : {round(          pm.v, 3)}
+        Z_vel          : {round(          pm.w, 3)}
+        Psi            : {round(        pm.psi, 3)}
+        Theta          : {round(      pm.theta, 3)}
+        Phi            : {round(        pm.phi, 3)}
+        Uptime         : {round(pm.t - start_t, 3)}
+
+
+        Target Coordinates: -
+
+        X_g            : {round(   pm.target_x, 3)}
+        Y_g            : {round(   pm.target_y, 3)}
+        Z_g            : {round(   pm.target_z, 3)}
+
+        X_b            : {round(        pm.Pbx, 3)}
+        Y_b            : {round(        pm.Pby, 3)}
+        Z_b            : {round(        pm.Pbz, 3)}
+
+
+        Calculated Inputs: -
+
+        Thrust         : {round(        thrust, 3)}
+        Roll           : {round(          roll, 3)}
+        Pitch          : {round(         pitch, 3)}
+        Yaw            : {round(           yaw, 3)}
+
+
+        Test Data: -
+
+        kb             : {round(         pm.kb, 3)}
+        rc_p           : {round(   pm.rc_pitch, 3)}
+        rc_q           : {round(    pm.rc_roll, 3)}
+        rc_r           : {round(  pm.rc_thrust, 3)}
+        model error cm : {round(    pm.mod_err, 3)}
+        ctrl_frequency : {round(       pm.freq, 3)}
+
+        -----------------------------------------
+        ''')
+
+        rate.sleep()
+
+        # try:
+        #     time.sleep(0.19 - (time.perf_counter() - last_t))
+        # except:
+        #     pass
+
+        # while time.perf_counter() - last_t <= 0.19999:
+        #     pass
+        
+        pm.freq = 1/(time.perf_counter() - last_t)
+        last_t  = time.perf_counter()

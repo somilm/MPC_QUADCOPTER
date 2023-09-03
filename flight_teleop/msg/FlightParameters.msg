@@ -1,0 +1,13 @@
+float32 m
+float32 g
+float32 Kpt
+float32 Kit
+float32 Kdt
+float32 Kwt
+float32 Kpx
+float32 Kix
+float32 Kdx
+float32 Kpy
+float32 Kiy
+float32 Kdy
+float32 takeoff_clearance
